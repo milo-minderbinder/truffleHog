@@ -157,9 +157,95 @@ def print_results(printJson, issue):
             print(printableDiff.encode('utf-8'))
         print("~~~~~~~~~~~~~~~~~~~~~")
 
+
+def merge_ranges(ranges):
+    """Return a generator over the non-overlapping/non-adjacent ranges, in order.
+
+    >>> ranges = [(-10, -4), (0, 0), (1, 5), (1, 5), (-5, 0), (1, 6), (-10, -5), (9, 10), (2, 6), (6, 8)]
+    >>> sorted(ranges)
+    [(-10, -5), (-10, -4), (-5, 0), (0, 0), (1, 5), (1, 5), (1, 6), (2, 6), (6, 8), (9, 10)]
+    >>> list(merge_ranges(ranges))
+    [(-10, 0), (1, 8), (9, 10)]
+    >>> list(merge_ranges([]))
+    []
+
+    :param ranges: iterable of range pairs in the form (start, stop)
+    :return: generator yielding the non-overlapping and non-adjecent range pairs, in order
+    """
+    ranges = sorted(ranges)
+    if not ranges:
+        return
+    current_start, current_stop = ranges[0]
+    for start, stop in ranges[1:]:
+        if start > current_stop:
+            yield current_start, current_stop
+            current_start, current_stop = start, stop
+        else:
+            current_stop = max(current_stop, stop)
+    yield current_start, current_stop
+
+
+def highlight_diff(printableDiff, ranges):
+    """Return `printableDiff` with each highlight position in `ranges` surrounded by bash color control characters.
+
+    The `ranges` parameter should be an iterable of `(<start_index>, <end_index>)` tuples designating where highlighted
+    index ranges should occur. These ranges are first consolidated such that overlapping and adjacent ranges are
+    combined before `printableDiff` is highlighted by inserting the bash color control character into those ranges.
+
+    >>> highlight_diff('foobar foo!', [(0, 3), (3, 6)])
+    '\\x1b[93mfoobar\\x1b[0m foo!'
+    >>> highlight_diff('foobar foo!', [(0, 3), (3, 6), (3, 10)])
+    '\\x1b[93mfoobar foo\\x1b[0m!'
+
+    :param printableDiff: string to highlight by inserting bash color control characters at the given index ranges
+    :param ranges: iterable of `(<start_index>, <end_index>)` tuples indicating where to highlight `printableDiff`
+    :return: string resulting from insertion of bash color highlights into `printableDiff` at the given index ranges
+    """
+    ranges = list(merge_ranges(r for r in ranges if r[0] != r[1]))
+    prev_end = 0
+    highlighted_diff = ''
+    for start, end in ranges:
+        highlighted_diff += '{unmatched_text}{hl_start}{hl_text}{hl_end}'.format(
+            unmatched_text=printableDiff[prev_end:start],
+            hl_start=bcolors.WARNING,
+            hl_text=printableDiff[start:end],
+            hl_end=bcolors.ENDC)
+        prev_end = end
+    highlighted_diff += printableDiff[prev_end:]
+    return highlighted_diff
+
+
+def get_ranges(string, substring):
+    """Return generator over the ranges, as tuples of `(<start_index>, <end_index>)`, where `substring` occurs in `string`.
+
+    Note that `substring` must be a non-empty string.
+
+    >>> list(get_ranges('foobar foo', ''))
+    []
+    >>> list(get_ranges('foobar foo', 'bar'))
+    [(3, 6)]
+    >>> list(get_ranges('foobar foo', 'foo'))
+    [(0, 3), (7, 10)]
+
+    :param string: the string to search for occurrences of `substring`
+    :param substring: the (non-empty) substring for which to search for occurrences of within `string`
+    :return: a generator yielding tuples of `(<start_index>, <end_index>)` where `substring` occurs within `string`
+    """
+    match_len = len(substring)
+    if match_len == 0:
+        return
+    start = string.find(substring)
+    while start != -1:
+        end = start + match_len
+        yield start, end
+        start = string.find(substring, end)
+
+
 def find_entropy(printableDiff, commit_time, branch_name, prev_commit, blob, commitHash):
     stringsFound = []
     lines = printableDiff.split("\n")
+    index = 0  # track the index offset for already scanned lines in printableDiff
+    finding_ranges = []
     for line in lines:
         for word in line.split():
             base64_strings = get_strings_of_set(word, BASE64_CHARS)
@@ -168,12 +254,14 @@ def find_entropy(printableDiff, commit_time, branch_name, prev_commit, blob, com
                 b64Entropy = shannon_entropy(string, BASE64_CHARS)
                 if b64Entropy > 4.5:
                     stringsFound.append(string)
-                    printableDiff = printableDiff.replace(string, bcolors.WARNING + string + bcolors.ENDC)
+                    finding_ranges.extend((s + index, e + index) for s, e in get_ranges(line, string))
             for string in hex_strings:
                 hexEntropy = shannon_entropy(string, HEX_CHARS)
                 if hexEntropy > 3:
                     stringsFound.append(string)
-                    printableDiff = printableDiff.replace(string, bcolors.WARNING + string + bcolors.ENDC)
+                    finding_ranges.extend((s + index, e + index) for s, e in get_ranges(line, string))
+        index += len(line) + 1  # account for newline character removed by `split('\n')`
+    found_diff = highlight_diff(printableDiff, finding_ranges)
     entropicDiff = None
     if len(stringsFound) > 0:
         entropicDiff = {}
@@ -183,17 +271,18 @@ def find_entropy(printableDiff, commit_time, branch_name, prev_commit, blob, com
         entropicDiff['commit'] = prev_commit.message
         entropicDiff['diff'] = blob.diff.decode('utf-8', errors='replace')
         entropicDiff['stringsFound'] = stringsFound
-        entropicDiff['printDiff'] = printableDiff
+        entropicDiff['printDiff'] = found_diff
         entropicDiff['commitHash'] = commitHash
         entropicDiff['reason'] = "High Entropy"
     return entropicDiff
 
+
 def regex_check(printableDiff, commit_time, branch_name, prev_commit, blob, commitHash):
     regex_matches = []
     for key in regexes:
-        found_strings = regexes[key].findall(printableDiff)
-        for found_string in found_strings:
-            found_diff = printableDiff.replace(printableDiff, bcolors.WARNING + found_string + bcolors.ENDC)
+        findings = list(m for m in regexes[key].finditer(printableDiff) if len(m.group()))
+        found_strings = ', '.join(m.group() for m in findings)
+        found_diff = highlight_diff(printableDiff, ((m.start(), m.end()) for m in findings))
         if found_strings:
             foundRegex = {}
             foundRegex['date'] = commit_time
