@@ -1,8 +1,14 @@
 import unittest
+import doctest
 import os
 import re
 from collections import namedtuple
 from truffleHog import truffleHog
+
+
+def load_tests(loader, tests, ignore):
+    tests.addTests(doctest.DocTestSuite(truffleHog))
+    return tests
 
 
 class TestStringMethods(unittest.TestCase):
