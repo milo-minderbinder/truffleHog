@@ -38,7 +38,7 @@ class Issue(object):
     @property
     def diff(self):
         if self._diff is None:
-            self._diff = self.blob.diff.encode('utf-8', errors='replace')
+            self._diff = self.blob.diff.decode('utf-8', errors='replace')
         return self._diff
 
     @property
@@ -259,9 +259,9 @@ def highlight_diff(printableDiff, ranges):
     """
     ranges = list(merge_ranges(r for r in ranges if r[0] != r[1]))
     prev_end = 0
-    highlighted_diff = ''
+    highlighted_diff = u''
     for start, end in ranges:
-        highlighted_diff += '{unmatched_text}{hl_start}{hl_text}{hl_end}'.format(
+        highlighted_diff += u'{unmatched_text}{hl_start}{hl_text}{hl_end}'.format(
             unmatched_text=printableDiff[prev_end:start],
             hl_start=bcolors.WARNING,
             hl_text=printableDiff[start:end],
